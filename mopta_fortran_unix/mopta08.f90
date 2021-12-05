@@ -14,8 +14,8 @@ program mopta08
     real*8         f
     real*8         g(ncon)
     
-    in_file  = "input2.txt"
-    out_file = "output2.txt"
+    in_file  = "input.txt"
+    out_file = "output.txt"
 
     open(7,FILE=in_file)
     do i=1,nvar
