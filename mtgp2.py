@@ -18,7 +18,7 @@ from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
-from mopta import mopta_evaluate2
+from mopta import mopta_evaluate
 
 class ExtendedThompsonSampling(SamplingStrategy):
     def __init__(
@@ -201,9 +201,9 @@ def generate_batch(
 
 X_turbo = get_initial_points(dim, n_init)
 Y_turbo = torch.tensor(
-    [-mopta_evaluate2(x)[0] for x in X_turbo], dtype=dtype, device=device
+    [-mopta_evaluate(x)[0] for x in X_turbo], dtype=dtype, device=device
 ).unsqueeze(-1)
-C_turbo = torch.stack([mopta_evaluate2(x)[1:] for x in X_turbo]).to(device)
+C_turbo = torch.stack([mopta_evaluate(x)[1:] for x in X_turbo]).to(device)
 
 state = TurboState(dim, batch_size=batch_size)
 
@@ -242,8 +242,8 @@ while not state.restart_triggered:  # Run until TuRBO converges
             n_candidates=N_CANDIDATES,
         )
 
-    Y_next = torch.tensor([-mopta_evaluate2(x)[0] for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
-    C_next = torch.stack([mopta_evaluate2(x)[1:] for x in X_next]).to(device)
+    Y_next = torch.tensor([-mopta_evaluate(x)[0] for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
+    C_next = torch.stack([mopta_evaluate(x)[1:] for x in X_next]).to(device)
 
     # Update state
     state = update_state(state=state, Y_next=Y_next, C_next=C_next)

@@ -1,70 +1,47 @@
 import math
 from dataclasses import dataclass
-from typing import List
 
 import torch
-from botorch.fit import fit_gpytorch_model
-from botorch.generation.sampling import SamplingStrategy
-from botorch.models import SingleTaskGP
 from torch.quasirandom import SobolEngine
-from botorch.models.model import Model
-from torch import Tensor
-from torch.nn import Module
-
 import gpytorch
 from gpytorch.constraints import Interval
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch.fit import fit_gpytorch_model
+from botorch.generation.sampling import SamplingStrategy
+from botorch.models import SingleTaskGP
 
 from mopta import mopta_evaluate
 
-class ExtendedThompsonSampling(SamplingStrategy):
-    def __init__(
-        self,
-        model: Model,
-        C_models: List[Model],
-        replacement: bool = True,
-    ) -> None:
-        super().__init__()
-        self.model = model
-        self.C_models = C_models
-        self.replacement = replacement
+torch.manual_seed(0)
 
-    def forward(
-        self, X: Tensor, num_samples: int = 1, observation_noise: bool = False
-    ) -> Tensor:
-        posterior = self.model.posterior(X, observation_noise=observation_noise)
-
-        # num_samples x batch_shape x N x m
-        samples = posterior.rsample(sample_shape=torch.Size([num_samples]))
-        constraints = torch.cat([C_model.posterior(X, observation_noise=observation_noise).rsample(sample_shape=torch.Size([num_samples]))
-                        for C_model in C_models], dim=2)
-        total_violation = torch.maximum(constraints, torch.zeros_like(constraints)).sum(dim=2)
-        obj = samples.squeeze() - 10**9 * total_violation
-        idcs = torch.argmax(obj, dim=-1)
-
-        # idcs is num_samples x batch_shape, to index into X we need to permute for it
-        # to have shape batch_shape x num_samples
-        if idcs.ndim > 1:
-            idcs = idcs.permute(*range(1, idcs.ndim), 0)
-        # in order to use gather, we need to repeat the index tensor d times
-        idcs = idcs.unsqueeze(-1).expand(*idcs.shape, X.size(-1))
-        # now if the model is batched batch_shape will not necessarily be the
-        # batch_shape of X, so we expand X to the proper shape
-        Xe = X.expand(*obj.shape[1:], X.size(-1))
-        # finally we can gather along the N dimension
-        return torch.gather(Xe, -2, idcs)
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 dtype = torch.double
-
 dim = 124
 batch_size = 10
 n_init = 130
 n_constraints = 68
-max_cholesky_size = float("inf")  # Always use Cholesky
+max_cholesky_size = float("inf")
+sobol_random_seed = 0
+
+
+class ExtendedThompsonSampling(SamplingStrategy):
+    def __init__(self, model, C_model):
+        super().__init__()
+        self.model = model
+        self.C_model = C_model
+
+    def forward(self, X, num_samples):
+        # num_samples x batch_shape x N x m
+        objectives = self.model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
+        constraints = self.C_model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
+        
+        total_violations = torch.maximum(constraints, torch.tensor(0., device=device)).sum(dim=1)
+        c_objs = objectives.squeeze() - 10**9 * total_violations.squeeze()
+
+        idcs = torch.argmax(c_objs, dim=-1)
+        return X[idcs, :]
 
 
 @dataclass
@@ -87,11 +64,10 @@ class TurboState:
 
 
 def update_state(state, Y_next, C_next):
-    if torch.any(torch.all(C_next <= 0, dim=1)):
-        new_best = max(Y_next[torch.all(C_next <= 0, dim=1), :]).item()
+    if torch.any(torch.all(C_next <= 0, dim=0)):
+        new_best = max(Y_next[torch.all(C_next <= 0, dim=0)]).item()
     else:
         new_best = -float("inf")
-
 
     if new_best > state.best_value + 1e-3 * math.fabs(state.best_value):
         state.success_counter += 1
@@ -115,15 +91,15 @@ def update_state(state, Y_next, C_next):
 
 state = TurboState(dim=dim, batch_size=batch_size)
 
-def get_initial_points(dim, n_pts, seed=1):
-    sobol = SobolEngine(dimension=dim, scramble=True, seed=seed)
+def get_initial_points(dim, n_pts):
+    sobol = SobolEngine(dimension=dim, scramble=True, seed=sobol_random_seed)
     X_init = sobol.draw(n=n_pts).to(dtype=dtype, device=device)
     return X_init
 
 def generate_batch(
     state,
     model,  # GP model for objective
-    C_models, # GP models for constraints
+    C_model, # GP model for constraints
     X,  # Evaluated points on the domain [0, 1]^d
     Y,  # Function values
     C,  # Constraints
@@ -132,13 +108,13 @@ def generate_batch(
 ):
     assert X.min() >= 0.0 and X.max() <= 1.0 and torch.all(torch.isfinite(Y))
 
-    if torch.any(torch.all(C <= 0, dim=1)):
-        CY = torch.where(torch.all(C <= 0, dim=1, keepdim=True), Y, -float("inf"))
+    if torch.any(torch.all(C <= 0, dim=0)):
+        CY = torch.where(torch.all(C <= 0, dim=0), Y, -float("inf"))
         x_center = X[CY.argmax(), :].clone()
     else:
-        total_violation = torch.maximum(C, torch.zeros_like(C)).sum(dim=1)
-        x_center = X[total_violation.argmin(), :].clone()
-        print(min(total_violation))
+        total_violations = torch.maximum(C, torch.tensor(0., device=device)).sum(dim=0)
+        x_center = X[total_violations.argmin(), :].clone()
+        print("Minimum total violation:", min(total_violations).item())
 
     # Scale the TR to be proportional to the lengthscales
     weights = model.covar_module.base_kernel.lengthscale.squeeze().detach()
@@ -148,7 +124,7 @@ def generate_batch(
     tr_ub = torch.clamp(x_center + weights * state.length / 2.0, 0.0, 1.0)
 
     dim = X.shape[-1]
-    sobol = SobolEngine(dim, scramble=True)
+    sobol = SobolEngine(dim, scramble=True, seed=sobol_random_seed)
     pert = sobol.draw(n_candidates).to(dtype=dtype, device=device)
     pert = tr_lb + (tr_ub - tr_lb) * pert
 
@@ -166,57 +142,44 @@ def generate_batch(
     X_cand[mask] = pert[mask]
 
     # Sample on the candidate points
-    thompson_sampling = ExtendedThompsonSampling(model=model, C_models=C_models)
+    thompson_sampling = ExtendedThompsonSampling(model=model, C_model=C_model)
     with torch.no_grad():  # We don't need gradients when using TS
         X_next = thompson_sampling(X_cand, num_samples=batch_size)
 
     return X_next
 
 X_turbo = get_initial_points(dim, n_init)
-Y_turbo = torch.tensor(
-    [-mopta_evaluate(x)[0] for x in X_turbo], dtype=dtype, device=device
-).unsqueeze(-1)
-C_turbo = torch.stack([mopta_evaluate(x)[1:] for x in X_turbo]).to(device)
+Y_turbo = torch.tensor([-mopta_evaluate(x)[0] for x in X_turbo], dtype=dtype, device=device).unsqueeze(-1)
+C_turbo = torch.stack([mopta_evaluate(x)[1:] for x in X_turbo], dim=1).to(device).unsqueeze(-1)
 
 state = TurboState(dim, batch_size=batch_size)
 
-
-N_CANDIDATES = min(5000, 200 * dim)
-
+N_CANDIDATES = min(2000, 200 * dim)
 
 while not state.restart_triggered:  # Run until TuRBO converges
     # Fit a GP model
     train_Y = (Y_turbo - Y_turbo.mean()) / Y_turbo.std()
     likelihood = GaussianLikelihood(noise_constraint=Interval(1e-8, 1e-3))
-    covar_module = ScaleKernel(  # Use the same lengthscale prior as in the TuRBO paper
-        MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0))
-    )
+    covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0)))
 
     model = SingleTaskGP(X_turbo, train_Y, covar_module=covar_module, likelihood=likelihood)
     mll = ExactMarginalLogLikelihood(model.likelihood, model)
 
-    C_models = []
-    C_mlls = []
-    for i in range(n_constraints):
-        train_C = C_turbo[:, [i]]
-        covar_module = ScaleKernel(  # Use the same lengthscale prior as in the TuRBO paper
-        MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0))
-        )
-        C_models.append(SingleTaskGP(X_turbo, train_C, covar_module=covar_module, likelihood=likelihood))
-        C_mlls.append(ExactMarginalLogLikelihood(C_models[-1].likelihood, C_models[-1]))
+    C_covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0)))
+    C_model = SingleTaskGP(X_turbo.repeat((n_constraints, 1, 1)), C_turbo, covar_module=C_covar_module, likelihood=likelihood)
+    C_mll = ExactMarginalLogLikelihood(C_model.likelihood, C_model)
 
     # Do the fitting and acquisition function optimization inside the Cholesky context
     with gpytorch.settings.max_cholesky_size(max_cholesky_size):
         # Fit the model
         fit_gpytorch_model(mll)
-        for i in range(n_constraints):
-            fit_gpytorch_model(C_mlls[i])
+        fit_gpytorch_model(C_mll)
     
         # Create a batch
         X_next = generate_batch(
             state=state,
             model=model,
-            C_models=C_models,
+            C_model=C_model,
             X=X_turbo,
             Y=Y_turbo,
             C=C_turbo,
@@ -224,8 +187,10 @@ while not state.restart_triggered:  # Run until TuRBO converges
             n_candidates=N_CANDIDATES,
         )
 
+    torch.cuda.empty_cache()
+    print("GPU memory:", torch.cuda.memory_allocated(device) / (1 << 30))
     Y_next = torch.tensor([-mopta_evaluate(x)[0] for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
-    C_next = torch.stack([mopta_evaluate(x)[1:] for x in X_next]).to(device)
+    C_next = torch.stack([mopta_evaluate(x)[1:] for x in X_next], dim=1).to(device).unsqueeze(-1)
 
     # Update state
     state = update_state(state=state, Y_next=Y_next, C_next=C_next)
@@ -233,9 +198,7 @@ while not state.restart_triggered:  # Run until TuRBO converges
     # Append data
     X_turbo = torch.cat((X_turbo, X_next), dim=0)
     Y_turbo = torch.cat((Y_turbo, Y_next), dim=0)
-    C_turbo = torch.cat((C_turbo, C_next), dim=0)
+    C_turbo = torch.cat((C_turbo, C_next), dim=1)
 
     # Print current status
-    print(
-        f"{len(X_turbo)}) Best value: {state.best_value:.2e}, TR length: {state.length:.2e}"
-    )
+    print(f"{len(X_turbo)}) Best value: {state.best_value:.2e}, TR length: {state.length:.2e}")
