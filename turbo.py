@@ -24,6 +24,7 @@ n_init = 130
 n_constraints = 68
 max_cholesky_size = float("inf")
 sobol_random_seed = 0
+max_queries = 2000
 
 
 class ExtendedThompsonSampling(SamplingStrategy):
@@ -156,7 +157,7 @@ state = TurboState(dim, batch_size=batch_size)
 
 N_CANDIDATES = min(2000, 200 * dim)
 
-while not state.restart_triggered:  # Run until TuRBO converges
+while len(X_turbo) < max_queries:
     # Fit a GP model
     train_Y = (Y_turbo - Y_turbo.mean()) / Y_turbo.std()
     likelihood = GaussianLikelihood(noise_constraint=Interval(1e-8, 1e-3))
