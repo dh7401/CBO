@@ -24,7 +24,7 @@ dtype = torch.double
 dim = 124
 batch_size = 10
 n_init = 130
-n_constraints = 68
+n_constraints = 20
 max_cholesky_size = float("inf")
 sobol_random_seed = 0
 max_queries = 2000
@@ -154,7 +154,7 @@ def generate_batch(
 
 X_turbo = get_initial_points(dim, n_init)
 Y_turbo = torch.tensor([-mopta_evaluate(x)[0] for x in X_turbo], dtype=dtype, device=device).unsqueeze(-1)
-C_turbo = torch.stack([mopta_evaluate(x)[1:] for x in X_turbo], dim=1).to(device).unsqueeze(-1)
+C_turbo = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_turbo], dim=1).to(device).unsqueeze(-1)
 
 state = TurboState(dim, batch_size=batch_size)
 
@@ -176,8 +176,8 @@ while len(X_turbo) < max_queries:
     with gpytorch.settings.max_cholesky_size(max_cholesky_size):
         # Fit the model
         fit_gpytorch_model(mll)
-        fit_gpytorch_torch(C_mll, options={"maxiter": 3, "lr": 0.01, "disp": False})
-    
+        fit_gpytorch_torch(C_mll, options={"maxiter": 300, "lr": .1, "disp": True})
+
         # Create a batch
         X_next = generate_batch(
             state=state,
@@ -193,7 +193,7 @@ while len(X_turbo) < max_queries:
     torch.cuda.empty_cache()
     print("GPU memory:", torch.cuda.memory_allocated(device) / (1 << 30))
     Y_next = torch.tensor([-mopta_evaluate(x)[0] for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
-    C_next = torch.stack([mopta_evaluate(x)[1:] for x in X_next], dim=1).to(device).unsqueeze(-1)
+    C_next = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_next], dim=1).to(device).unsqueeze(-1)
 
     # Update state
     state = update_state(state=state, Y_next=Y_next, C_next=C_next)
