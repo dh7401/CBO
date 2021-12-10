@@ -23,7 +23,6 @@ batch_size = 10
 n_init = 130
 n_constraints = 68
 max_cholesky_size = float("inf")
-sobol_random_seed = 0
 max_queries = 2000
 
 
@@ -93,7 +92,7 @@ def update_state(state, Y_next, C_next):
 state = TurboState(dim=dim, batch_size=batch_size)
 
 def get_initial_points(dim, n_pts):
-    sobol = SobolEngine(dimension=dim, scramble=True, seed=sobol_random_seed)
+    sobol = SobolEngine(dimension=dim, scramble=True, seed=torch.randint(100, (1,)).item())
     X_init = sobol.draw(n=n_pts).to(dtype=dtype, device=device)
     return X_init
 
@@ -125,7 +124,7 @@ def generate_batch(
     tr_ub = torch.clamp(x_center + weights * state.length / 2.0, 0.0, 1.0)
 
     dim = X.shape[-1]
-    sobol = SobolEngine(dim, scramble=True, seed=sobol_random_seed)
+    sobol = SobolEngine(dim, scramble=True, seed=torch.randint(100, (1,)).item())
     pert = sobol.draw(n_candidates).to(dtype=dtype, device=device)
     pert = tr_lb + (tr_ub - tr_lb) * pert
 
