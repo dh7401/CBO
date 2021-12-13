@@ -21,22 +21,26 @@ dtype = torch.double
 dim = 124
 batch_size = 10
 n_init = 130
-n_constraints = 68
+n_constraints = 30
 max_cholesky_size = float("inf")
 max_queries = 2000
 
 
 class ExtendedThompsonSampling(SamplingStrategy):
-    def __init__(self, model, C_model):
+    def __init__(self, model, C_model_1, C_model_2):
         super().__init__()
         self.model = model
-        self.C_model = C_model
+        self.C_model_1 = C_model_1
+        self.C_model_2 = C_model_2
 
     def forward(self, X, num_samples):
         # num_samples x batch_shape x N x m
         objectives = self.model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
-        constraints = self.C_model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
-        
+
+        constraints_1 = self.C_model_1.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
+        constraints_2 = self.C_model_2.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
+        constraints = torch.cat([constraints_1, constraints_2], dim=1)
+
         total_violations = torch.maximum(constraints, torch.tensor(0., device=device)).sum(dim=1)
         c_objs = objectives.squeeze() - 10**9 * total_violations.squeeze()
 
@@ -99,7 +103,8 @@ def get_initial_points(dim, n_pts):
 def generate_batch(
     state,
     model,  # GP model for objective
-    C_model, # GP model for constraints
+    C_model_1, # GP model for constraints (first half)
+    C_model_2, # Second half
     X,  # Evaluated points on the domain [0, 1]^d
     Y,  # Function values
     C,  # Constraints
@@ -142,7 +147,7 @@ def generate_batch(
     X_cand[mask] = pert[mask]
 
     # Sample on the candidate points
-    thompson_sampling = ExtendedThompsonSampling(model=model, C_model=C_model)
+    thompson_sampling = ExtendedThompsonSampling(model=model, C_model_1=C_model_1, C_model_2=C_model_2)
     with torch.no_grad():  # We don't need gradients when using TS
         X_next = thompson_sampling(X_cand, num_samples=batch_size)
 
@@ -165,21 +170,31 @@ while len(X_turbo) < max_queries:
     model = SingleTaskGP(X_turbo, train_Y, covar_module=covar_module, likelihood=likelihood)
     mll = ExactMarginalLogLikelihood(model.likelihood, model)
 
-    C_covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0)))
-    C_model = SingleTaskGP(X_turbo.repeat((n_constraints, 1, 1)), C_turbo, covar_module=C_covar_module, likelihood=likelihood)
-    C_mll = ExactMarginalLogLikelihood(C_model.likelihood, C_model)
+    # Split constraints into two batch GPs
+    # Assume n_constraints == 0 (mod 2)
+    C_likelihood_1 = GaussianLikelihood(noise_constraint=Interval(1e-8, 1e-3))
+    C_covar_module_1 = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0)))
+    C_model_1 = SingleTaskGP(X_turbo.repeat((n_constraints//2, 1, 1)), C_turbo[:n_constraints//2, :, :], covar_module=C_covar_module_1, likelihood=C_likelihood_1)
+    C_mll_1 = ExactMarginalLogLikelihood(C_model_1.likelihood, C_model_1)
+
+    C_likelihood_2 = GaussianLikelihood(noise_constraint=Interval(1e-8, 1e-3))
+    C_covar_module_2 = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=dim, lengthscale_constraint=Interval(0.005, 4.0)))
+    C_model_2 = SingleTaskGP(X_turbo.repeat((n_constraints//2, 1, 1)), C_turbo[n_constraints//2:, :, :], covar_module=C_covar_module_2, likelihood=C_likelihood_2)
+    C_mll_2 = ExactMarginalLogLikelihood(C_model_2.likelihood, C_model_2)
 
     # Do the fitting and acquisition function optimization inside the Cholesky context
     with gpytorch.settings.max_cholesky_size(max_cholesky_size):
         # Fit the model
         fit_gpytorch_model(mll)
-        fit_gpytorch_model(C_mll)
+        fit_gpytorch_model(C_mll_1)
+        fit_gpytorch_model(C_mll_2)
     
         # Create a batch
         X_next = generate_batch(
             state=state,
             model=model,
-            C_model=C_model,
+            C_model_1=C_model_1,
+            C_model_2=C_model_2,
             X=X_turbo,
             Y=Y_turbo,
             C=C_turbo,
