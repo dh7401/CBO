@@ -19,12 +19,11 @@ torch.manual_seed(0)
 
 device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 torch.cuda.set_device(device)
-# device = torch.device("cpu")
 dtype = torch.double
 dim = 124
 batch_size = 10
 n_init = 130
-n_constraints = 20
+n_constraints = 30
 max_cholesky_size = float("inf")
 max_queries = 2000
 
@@ -38,8 +37,14 @@ class ExtendedThompsonSampling(SamplingStrategy):
     def forward(self, X, num_samples):
         # num_samples x batch_shape x N x m
         objectives = self.model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
-        constraints = self.C_model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
-
+        with gpytorch.settings.fast_pred_var():
+            constraints = []
+            posterior = self.C_model.posterior(X, observation_noise=False)
+            for i in range(num_samples):
+                constraint_sample_i = posterior.rsample(sample_shape=torch.Size([1]))
+                constraints.append(constraint_sample_i)
+                
+        constraints = torch.cat(constraints)
         total_violations = torch.maximum(constraints, torch.tensor(0., device=device)).sum(dim=2)
         c_objs = objectives.squeeze() - 10**9 * total_violations.squeeze()
 
@@ -175,7 +180,7 @@ while len(X_turbo) < max_queries:
     with gpytorch.settings.max_cholesky_size(max_cholesky_size):
         # Fit the model
         fit_gpytorch_model(mll)
-        fit_gpytorch_torch(C_mll, options={"maxiter": 300, "lr": .1, "disp": True})
+        fit_gpytorch_torch(C_mll, options={"maxiter": 5, "lr": .1, "disp": True})
 
         # Create a batch
         X_next = generate_batch(
