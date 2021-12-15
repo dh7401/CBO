@@ -1,3 +1,4 @@
+import argparse
 import math
 from dataclasses import dataclass
 
@@ -10,46 +11,33 @@ from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.fit import fit_gpytorch_model
 from botorch.optim.fit import fit_gpytorch_torch
-from botorch.generation.sampling import SamplingStrategy
 from botorch.models import SingleTaskGP, KroneckerMultiTaskGP
 
 from mopta import mopta_evaluate
+from sampling import ExtendedThompsonSampling, FeasibleProbSampling, HybridThompsonSampling
+
+
+# Choosing search method
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("--search", help='''Choose a search method.\n
+                                        ets: Extended Thompson Sampling\n
+                                        hts: Hybrid Thompson Sampling\n
+                                        fprob: Feasible Probability Sampling'''
+                    , choices=["ets", "hts", "fprob"], required=True)
+args = parser.parse_args()
+
 
 torch.manual_seed(0)
 
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.cuda.set_device(device)
 dtype = torch.double
 dim = 124
-batch_size = 10
-n_init = 130
+batch_size = 15
+n_init = 50
 n_constraints = 30
 max_cholesky_size = float("inf")
-max_queries = 2000
-
-
-class ExtendedThompsonSampling(SamplingStrategy):
-    def __init__(self, model, C_model):
-        super().__init__()
-        self.model = model
-        self.C_model = C_model
-
-    def forward(self, X, num_samples):
-        # num_samples x batch_shape x N x m
-        objectives = self.model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
-        with gpytorch.settings.fast_pred_var():
-            constraints = []
-            posterior = self.C_model.posterior(X, observation_noise=False)
-            for i in range(num_samples):
-                constraint_sample_i = posterior.rsample(sample_shape=torch.Size([1]))
-                constraints.append(constraint_sample_i)
-                
-        constraints = torch.cat(constraints)
-        total_violations = torch.maximum(constraints, torch.tensor(0., device=device)).sum(dim=2)
-        c_objs = objectives.squeeze() - 10**9 * total_violations.squeeze()
-
-        idcs = torch.argmax(c_objs, dim=-1)
-        return X[idcs, :]
+max_queries = 500
 
 
 @dataclass
@@ -124,6 +112,11 @@ def generate_batch(
         x_center = X[total_violations.argmin(), :].clone()
         print("Minimum total violation:", min(total_violations).item())
 
+    if state.best_value == -float("inf"):
+        current_best = 0.
+    else:
+        current_best = state.best_value
+
     # Scale the TR to be proportional to the lengthscales
     weights = model.covar_module.base_kernel.lengthscale.squeeze().detach()
     weights = weights / weights.mean()
@@ -150,9 +143,14 @@ def generate_batch(
     X_cand[mask] = pert[mask]
 
     # Sample on the candidate points
-    thompson_sampling = ExtendedThompsonSampling(model=model, C_model=C_model)
+    if args.search == "ets":
+        sampling = ExtendedThompsonSampling(model=model, C_model=C_model)
+    elif args.search == "hts":
+        sampling = HybridThompsonSampling(model=model, C_model=C_model, current_best=current_best)
+    elif args.search == "fprob":
+        sampling = FeasibleProbSampling(model=model, C_model=C_model)
     with torch.no_grad():  # We don't need gradients when using TS
-        X_next = thompson_sampling(X_cand, num_samples=batch_size)
+        X_next = sampling(X_cand, num_samples=batch_size)
 
     return X_next
 
