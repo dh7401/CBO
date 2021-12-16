@@ -1,3 +1,4 @@
+import argparse
 import math
 from dataclasses import dataclass
 
@@ -14,16 +15,21 @@ from botorch.models import SingleTaskGP
 
 from mopta import mopta_evaluate
 
-torch.manual_seed(0)
 
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+parser.add_argument("--seed", type=int, required=True)
+args = parser.parse_args()
+
+
+torch.manual_seed(args.seed)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.double
 dim = 124
-batch_size = 10
-n_init = 130
+batch_size = 20
+n_init = 100
 n_constraints = 30
 max_cholesky_size = float("inf")
-max_queries = 2000
+max_queries = 500
 
 
 class ExtendedThompsonSampling(SamplingStrategy):
@@ -159,7 +165,7 @@ C_turbo = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_turbo
 
 state = TurboState(dim, batch_size=batch_size)
 
-N_CANDIDATES = min(2000, 200 * dim)
+N_CANDIDATES = 200
 
 while len(X_turbo) < max_queries:
     # Fit a GP model

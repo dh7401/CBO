@@ -2,6 +2,7 @@ import argparse
 import math
 from dataclasses import dataclass
 
+from scipy.stats import multivariate_normal
 import torch
 from torch.quasirandom import SobolEngine
 import gpytorch
@@ -24,21 +25,22 @@ parser.add_argument("--search", help='''Choose a search method.\n
                                         hts: Hybrid Thompson Sampling\n
                                         fprob: Feasible Probability Sampling'''
                     , choices=["ets", "hts", "fprob"], required=True)
+parser.add_argument("--seed", type=int, required=True)
 args = parser.parse_args()
 
 
-torch.manual_seed(0)
+torch.manual_seed(args.seed)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.cuda.set_device(device)
 dtype = torch.double
 dim = 124
-batch_size = 15
-n_init = 50
+batch_size = 20
+n_init = 100
 n_constraints = 30
 max_cholesky_size = float("inf")
 max_queries = 500
-
+n_iterations = 3 # GP training iteration
 
 @dataclass
 class TurboState:
@@ -109,11 +111,20 @@ def generate_batch(
         x_center = X[CY.argmax(), :].clone()
     else:
         total_violations = torch.maximum(C, torch.tensor(0., device=device)).sum(dim=0)
-        x_center = X[total_violations.argmin(), :].clone()
         print("Minimum total violation:", min(total_violations).item())
 
+        if args.search == "ets":
+            x_center = X[total_violations.argmin(), :].clone()
+        else:
+            print('here')
+            task_covar = C_model.covar_module.task_covar_module._eval_covar_matrix().tolist()
+            feasible_prob = multivariate_normal.cdf(x=(-C.squeeze().t()).tolist(), mean=[0.] * C.shape[0], cov=task_covar)
+            feasible_prob = torch.tensor(feasible_prob, device=X.device)
+            x_center = X[feasible_prob.argmax(), :].clone()
+        
+
     if state.best_value == -float("inf"):
-        current_best = 0.
+        current_best = -500.
     else:
         current_best = state.best_value
 
@@ -160,7 +171,7 @@ C_turbo = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_turbo
 
 state = TurboState(dim, batch_size=batch_size)
 
-N_CANDIDATES = min(2000, 200 * dim)
+N_CANDIDATES = 200
 
 
 while len(X_turbo) < max_queries:
@@ -178,7 +189,7 @@ while len(X_turbo) < max_queries:
     with gpytorch.settings.max_cholesky_size(max_cholesky_size):
         # Fit the model
         fit_gpytorch_model(mll)
-        fit_gpytorch_torch(C_mll, options={"maxiter": 5, "lr": .1, "disp": True})
+        fit_gpytorch_torch(C_mll, options={"maxiter": n_iterations, "lr": .1, "disp": True})
 
         # Create a batch
         X_next = generate_batch(
