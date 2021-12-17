@@ -505,7 +505,8 @@ def demo_heuristic_lander(env=LunarLander(), seed=None, params=[0.] * 12):
         total_reward += r
 
         steps += 1
-        if done:
+
+        if done or steps >= 1000:
             break
 
     return total_reward
