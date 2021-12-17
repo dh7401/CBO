@@ -3,6 +3,9 @@ import random
 import subprocess
 import torch
 
+from lunar_lander.lunar_lander import demo_heuristic_lander
+
+
 def mopta_evaluate(X):
     '''
     input: torch.tensor \in [0, 1]^124
@@ -25,3 +28,16 @@ def mopta_evaluate(X):
     os.chdir("../")
     os.rmdir(os.getcwd() + "/tmp_" + suffix)
     return torch.tensor([float(line.strip()) for line in lines])
+
+def lunar_lander_evaluate(X, m=30):
+    '''
+    input: torch.tensor \in [0, 1]^12
+    output: torch.tensor([f, c_1, \dots, c_m])
+    '''
+    results = [0.]
+    for i in range(m):
+        reward = demo_heuristic_lander(seed=i, params=X.tolist())
+        results[0] += reward
+        results.append(200 - reward)
+    results[0] /= m
+    return torch.tensor(results)
