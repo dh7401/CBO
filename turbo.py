@@ -13,23 +13,39 @@ from botorch.fit import fit_gpytorch_model
 from botorch.generation.sampling import SamplingStrategy
 from botorch.models import SingleTaskGP
 
-from mopta import mopta_evaluate
+from utils import mopta_evaluate, lunar_lander_evaluate
 
-
-parser.add_argument("--seed", type=int, required=True)
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("--seed", help="Random seed (integer)", type=int, required=True)
+parser.add_argument("--problem", help='''Choose a problem to solve.\n
+                                         mopta: MOPTA08\n
+                                         lunar: Lunar Lander\n''' 
+                    , choices=["mopta", "lunar"], required=True)
 args = parser.parse_args()
 
 
 torch.manual_seed(args.seed)
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 dtype = torch.double
-dim = 124
-batch_size = 20
-n_init = 100
-n_constraints = 30
 max_cholesky_size = float("inf")
-max_queries = 500
+
+if args.problem == "mopta":
+    dim = 124
+    batch_size = 20
+    n_init = 100
+    n_constraints = 30
+    max_queries = 500
+    flip_sign = -1. # If minimization, flip sign of the objective.
+    eval_func = mopta_evaluate
+
+if args.problem == "lunar":
+    dim = 12
+    batch_size = 50
+    n_init = 100
+    n_constraints = 50
+    max_queries = 500
+    flip_sign = 1.
+    eval_func = lunar_lander_evaluate
 
 
 class ExtendedThompsonSampling(SamplingStrategy):
@@ -160,8 +176,16 @@ def generate_batch(
     return X_next
 
 X_turbo = get_initial_points(dim, n_init)
-Y_turbo = torch.tensor([-mopta_evaluate(x)[0] for x in X_turbo], dtype=dtype, device=device).unsqueeze(-1)
-C_turbo = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_turbo], dim=1).to(device).unsqueeze(-1)
+
+Y_list = []
+C_list = []
+for x in X_turbo:
+    res = eval_func(x)
+    Y_list.append(flip_sign * res[0])
+    C_list.append(res[1 : n_constraints + 1])
+
+Y_turbo = torch.tensor(Y_list, dtype=dtype, device=device).unsqueeze(-1)
+C_turbo = torch.stack(C_list, dim=1).to(device).unsqueeze(-1)
 
 state = TurboState(dim, batch_size=batch_size)
 
@@ -210,8 +234,16 @@ while len(X_turbo) < max_queries:
 
     torch.cuda.empty_cache()
     print("GPU memory:", torch.cuda.memory_allocated(device) / (1 << 30))
-    Y_next = torch.tensor([-mopta_evaluate(x)[0] for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
-    C_next = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_next], dim=1).to(device).unsqueeze(-1)
+
+    Y_list = []
+    C_list = []
+    for x in X_next:
+        res = eval_func(x)
+        Y_list.append(flip_sign * res[0])
+        C_list.append(res[1 : n_constraints + 1])
+
+    Y_next = torch.tensor(Y_list, dtype=dtype, device=device).unsqueeze(-1)
+    C_next = torch.stack(C_list, dim=1).to(device).unsqueeze(-1)
 
     # Update state
     state = update_state(state=state, Y_next=Y_next, C_next=C_next)
