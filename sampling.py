@@ -38,13 +38,11 @@ class HybridThompsonSampling(SamplingStrategy):
     def forward(self, X, num_samples):
         objectives = self.model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
 
-        feasible_prob = []
         self.C_model.eval()
-        for x in X:
-            mean = self.C_model(x.unsqueeze(dim=0)).mean.tolist()[0]
-            cov = self.C_model(x.unsqueeze(dim=0)).covariance_matrix.tolist()
-            feasible_prob.append(multivariate_normal.cdf(x=[0.] * len(mean), mean=mean, cov=cov))
+        task_covar = self.C_model.covar_module.task_covar_module._eval_covar_matrix().tolist()
+        mean = self.C_model(X).mean
 
+        feasible_prob = multivariate_normal.cdf(x=(-mean).tolist(), mean=[0.] * mean.shape[1], cov=task_covar)
         feasible_prob = torch.tensor(feasible_prob, device=X.device)
         c_ei = torch.maximum(objectives.squeeze() - self.current_best, torch.tensor(0.)) * feasible_prob
 
@@ -61,12 +59,12 @@ class FeasibleProbSampling(SamplingStrategy):
     def forward(self, X, num_samples):
         objectives = self.model.posterior(X, observation_noise=False).rsample(sample_shape=torch.Size([num_samples]))
 
-        feasible_prob = []
         self.C_model.eval()
-        for x in X:
-            mean = self.C_model(x.unsqueeze(dim=0)).mean.tolist()[0]
-            cov = self.C_model(x.unsqueeze(dim=0)).covariance_matrix.tolist()
-            feasible_prob.append(multivariate_normal.cdf(x=[0.] * len(mean), mean=mean, cov=cov))
+        task_covar = self.C_model.covar_module.task_covar_module._eval_covar_matrix().tolist()
+        mean = self.C_model(X).mean
 
-        _, idcs = torch.topk(torch.tensor(feasible_prob), num_samples)
+        feasible_prob = multivariate_normal.cdf(x=(-mean).tolist(), mean=[0.] * mean.shape[1], cov=task_covar)
+        feasible_prob = torch.tensor(feasible_prob, device=X.device)
+
+        _, idcs = torch.topk(feasible_prob, num_samples)
         return X[idcs, :]
