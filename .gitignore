@@ -1,5 +1,7 @@
 mopta_fortran_unix/run
 tmp_*/
+*.txt
+*.pgf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
