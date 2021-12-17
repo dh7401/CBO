@@ -29,7 +29,7 @@ def mopta_evaluate(X):
     os.rmdir(os.getcwd() + "/tmp_" + suffix)
     return torch.tensor([float(line.strip()) for line in lines])
 
-def lunar_lander_evaluate(X, m=30):
+def lunar_lander_evaluate(X, m=50):
     '''
     input: torch.tensor \in [0, 1]^12
     output: torch.tensor([f, c_1, \dots, c_m])
