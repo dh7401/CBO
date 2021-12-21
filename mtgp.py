@@ -14,33 +14,50 @@ from botorch.fit import fit_gpytorch_model
 from botorch.optim.fit import fit_gpytorch_torch
 from botorch.models import SingleTaskGP, KroneckerMultiTaskGP
 
-from mopta import mopta_evaluate
+from utils import mopta_evaluate, lunar_lander_evaluate
 from sampling import ExtendedThompsonSampling, FeasibleProbSampling, HybridThompsonSampling
 
 
 # Choosing search method
 parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("--seed", type=int, required=True)
+parser.add_argument("--problem", help='''Choose a problem to solve.\n
+                                         mopta: MOPTA08\n
+                                         lunar: Lunar Lander\n''' 
+                    , choices=["mopta", "lunar"], required=True)
 parser.add_argument("--search", help='''Choose a search method.\n
                                         ets: Extended Thompson Sampling\n
-                                        hts: Hybrid Thompson Sampling\n
-                                        fprob: Feasible Probability Sampling'''
-                    , choices=["ets", "hts", "fprob"], required=True)
-parser.add_argument("--seed", type=int, required=True)
+                                        hts: Hybrid Thompson Sampling\n'''
+                    , choices=["ets", "hts"], required=True)
+parser.add_argument("--gpu_idx", help="Index of GPU to use (integer)", type=int, required=True)
 args = parser.parse_args()
 
 
 torch.manual_seed(args.seed)
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(f"cuda:{args.gpu_idx}" if torch.cuda.is_available() else "cpu")
 torch.cuda.set_device(device)
 dtype = torch.double
-dim = 124
-batch_size = 20
-n_init = 100
-n_constraints = 30
 max_cholesky_size = float("inf")
-max_queries = 500
-n_iterations = 3 # GP training iteration
+n_iterations = 20 # GP training iteration
+
+if args.problem == "mopta":
+    dim = 124
+    batch_size = 20
+    n_init = 100
+    n_constraints = 30
+    max_queries = 500
+    flip_sign = -1. # If minimization, flip sign of the objective.
+    eval_func = mopta_evaluate
+
+if args.problem == "lunar":
+    dim = 12
+    batch_size = 50
+    n_init = 50
+    n_constraints = 50
+    max_queries = 300
+    flip_sign = 1.
+    eval_func = lunar_lander_evaluate
+
 
 @dataclass
 class TurboState:
@@ -106,7 +123,8 @@ def generate_batch(
 ):
     assert X.min() >= 0.0 and X.max() <= 1.0 and torch.all(torch.isfinite(Y))
 
-    if torch.any(torch.all(C <= 0, dim=0)):
+    feasible_found = torch.any(torch.all(C <= 0, dim=0))
+    if feasible_found:
         CY = torch.where(torch.all(C <= 0, dim=0), Y, -float("inf"))
         x_center = X[CY.argmax(), :].clone()
     else:
@@ -116,17 +134,11 @@ def generate_batch(
         if args.search == "ets":
             x_center = X[total_violations.argmin(), :].clone()
         else:
-            print('here')
             task_covar = C_model.covar_module.task_covar_module._eval_covar_matrix().tolist()
             feasible_prob = multivariate_normal.cdf(x=(-C.squeeze().t()).tolist(), mean=[0.] * C.shape[0], cov=task_covar)
             feasible_prob = torch.tensor(feasible_prob, device=X.device)
             x_center = X[feasible_prob.argmax(), :].clone()
         
-
-    if state.best_value == -float("inf"):
-        current_best = -500.
-    else:
-        current_best = state.best_value
 
     # Scale the TR to be proportional to the lengthscales
     weights = model.covar_module.base_kernel.lengthscale.squeeze().detach()
@@ -156,9 +168,9 @@ def generate_batch(
     # Sample on the candidate points
     if args.search == "ets":
         sampling = ExtendedThompsonSampling(model=model, C_model=C_model)
-    elif args.search == "hts":
-        sampling = HybridThompsonSampling(model=model, C_model=C_model, current_best=current_best)
-    elif args.search == "fprob":
+    elif feasible_found:
+        sampling = HybridThompsonSampling(model=model, C_model=C_model, current_best=state.best_value)
+    else:
         sampling = FeasibleProbSampling(model=model, C_model=C_model)
     with torch.no_grad():  # We don't need gradients when using TS
         X_next = sampling(X_cand, num_samples=batch_size)
@@ -166,8 +178,16 @@ def generate_batch(
     return X_next
 
 X_turbo = get_initial_points(dim, n_init)
-Y_turbo = torch.tensor([-mopta_evaluate(x)[0] for x in X_turbo], dtype=dtype, device=device).unsqueeze(-1)
-C_turbo = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_turbo], dim=1).to(device).unsqueeze(-1)
+
+Y_list = []
+C_list = []
+for x in X_turbo:
+    res = eval_func(x)
+    Y_list.append(flip_sign * res[0])
+    C_list.append(res[1 : n_constraints + 1])
+
+Y_turbo = torch.tensor(Y_list, dtype=dtype, device=device).unsqueeze(-1)
+C_turbo = torch.stack(C_list, dim=1).to(device).unsqueeze(-1)
 
 state = TurboState(dim, batch_size=batch_size)
 
@@ -189,7 +209,7 @@ while len(X_turbo) < max_queries:
     with gpytorch.settings.max_cholesky_size(max_cholesky_size):
         # Fit the model
         fit_gpytorch_model(mll)
-        fit_gpytorch_torch(C_mll, options={"maxiter": n_iterations, "lr": .1, "disp": True})
+        fit_gpytorch_torch(C_mll, options={"maxiter": n_iterations, "lr": .3, "disp": True})
 
         # Create a batch
         X_next = generate_batch(
@@ -205,8 +225,16 @@ while len(X_turbo) < max_queries:
 
     torch.cuda.empty_cache()
     print("GPU memory:", torch.cuda.memory_allocated(device) / (1 << 30))
-    Y_next = torch.tensor([-mopta_evaluate(x)[0] for x in X_next], dtype=dtype, device=device).unsqueeze(-1)
-    C_next = torch.stack([mopta_evaluate(x)[1 : n_constraints + 1] for x in X_next], dim=1).to(device).unsqueeze(-1)
+    
+    Y_list = []
+    C_list = []
+    for x in X_next:
+        res = eval_func(x)
+        Y_list.append(flip_sign * res[0])
+        C_list.append(res[1 : n_constraints + 1])
+
+    Y_next = torch.tensor(Y_list, dtype=dtype, device=device).unsqueeze(-1)
+    C_next = torch.stack(C_list, dim=1).to(device).unsqueeze(-1)
 
     # Update state
     state = update_state(state=state, Y_next=Y_next, C_next=C_next)

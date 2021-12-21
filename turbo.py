@@ -21,11 +21,12 @@ parser.add_argument("--problem", help='''Choose a problem to solve.\n
                                          mopta: MOPTA08\n
                                          lunar: Lunar Lander\n''' 
                     , choices=["mopta", "lunar"], required=True)
+parser.add_argument("--gpu_idx", help="Index of GPU to use (integer)", type=int, required=True)
 args = parser.parse_args()
 
 
 torch.manual_seed(args.seed)
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device = torch.device(f"cuda:{args.gpu_idx}" if torch.cuda.is_available() else "cpu")
 dtype = torch.double
 max_cholesky_size = float("inf")
 
@@ -41,9 +42,9 @@ if args.problem == "mopta":
 if args.problem == "lunar":
     dim = 12
     batch_size = 50
-    n_init = 100
+    n_init = 50
     n_constraints = 50
-    max_queries = 500
+    max_queries = 300
     flip_sign = 1.
     eval_func = lunar_lander_evaluate
 
